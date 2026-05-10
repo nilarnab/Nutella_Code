@@ -11,26 +11,31 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 import wandb
 
-# os.environ["WANDB_API_KEY"] = "some api key I am not gonna tell"
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
 class Config:
+    # Episode settings
     N_WAY      = 5
     K_SHOT     = 1
     N_QUERY    = 15
 
+    # Training
     N_EPISODES = 300_000
     LR         = 1e-3
     LR_STEP    = 100_000
     GRAD_CLIP  = 0.5
 
+    # Eval
     EVAL_EVERY = 1000
     EVAL_EPS   = 1000
     N_VAL_WAY  = 5
     N_VAL_SHOT = 1
 
-    DATASET = "omniglot" # or that miniimage thing
+    # Dataset: 'omniglot' or 'miniimagenet'
+    # DATASET    = 'miniimagenet'
+    DATASET = "omniglot"
 
+    # Misc
     SEED       = 42
     DEVICE     = (
         'cuda' if torch.cuda.is_available()
@@ -48,9 +53,18 @@ torch.manual_seed(cfg.SEED)
 
 
 class FewShotDataset(Dataset):
+    """
+    Thin wrapper around any (image, label) dataset that pre-builds a
+    class → [indices] index for O(1) episode sampling.
+
+    Args:
+        base_dataset : any torchvision-style dataset
+        class_ids    : optional list of class labels to keep (for splits)
+    """
     def __init__(self, base_dataset, class_ids=None):
         self.dataset = base_dataset
 
+        # build class → sample indices mapping
         self.class_to_indices: dict[int, list[int]] = defaultdict(list)
         for i in range(len(base_dataset)):
             _, lbl = base_dataset[i]
@@ -73,11 +87,21 @@ class FewShotDataset(Dataset):
 
 
 class EpisodeSampler:
+    """
+    Samples N-way K-shot episodes from a FewShotDataset.
+    """
     def __init__(self, few_shot_dataset: FewShotDataset, device: str):
         self.ds     = few_shot_dataset
         self.device = device
 
     def sample(self, n_way: int, k_shot: int, n_query: int):
+        """
+        Returns:
+            support  : (n_way * k_shot, C, H, W)
+            s_labels : (n_way * k_shot,)  local class indices 0..n_way-1
+            queries  : (n_way * n_query, C, H, W)
+            q_labels : (n_way * n_query,) local class indices 0..n_way-1
+        """
         chosen = random.sample(self.ds.classes, n_way)
 
         support_imgs,  support_labels = [], []
@@ -97,6 +121,7 @@ class EpisodeSampler:
                 query_imgs.append(img)
                 query_labels.append(local_idx)
 
+        # shuffle queries
         perm     = torch.randperm(len(query_imgs))
         support  = torch.stack(support_imgs).to(self.device)
         queries  = torch.stack([query_imgs[i] for i in perm]).to(self.device)
@@ -110,9 +135,14 @@ class EpisodeSampler:
 
 
 def get_datasets(cfg: Config):
+    """
+    Returns (train_sampler, val_sampler, in_channels, relation_input_size).
+    """
     root = os.path.expanduser('~/data')
 
     if cfg.DATASET == 'miniimagenet':
+        # Expects ~/data/miniimagenet/train/ and ~/data/miniimagenet/validation/
+        # each containing per-class sub-folders of JPEG images.
         tf = transforms.Compose([
             transforms.Resize(84),
             transforms.CenterCrop(84),
@@ -130,13 +160,16 @@ def get_datasets(cfg: Config):
         val_fs   = FewShotDataset(val_base)
 
         in_channels  = 3
-        input_size   = 576
+        input_size   = 576   # 64 * 3 * 3  (after two max-pools on 84×84)
 
     elif cfg.DATASET == 'omniglot':
+        # torchvision downloads Omniglot automatically.
         tf = transforms.Compose([
             transforms.Resize(28),
             transforms.ToTensor(),
         ])
+        # background=True  → 964  classes (training alphabets)
+        # background=False → 659  classes (evaluation alphabets)
         train_base = datasets.Omniglot(
             root=root, background=True,  transform=tf, download=True)
         val_base   = datasets.Omniglot(
@@ -146,13 +179,13 @@ def get_datasets(cfg: Config):
         val_fs   = FewShotDataset(val_base)
 
         in_channels = 1
-        input_size  = 64
+        input_size  = 64   # 64 * 1 * 1  (after two max-pools on 28×28)
 
     else:
-        raise ValueError(f"Not found this one here: {cfg.DATASET!r}")
+        raise ValueError(f"Unknown dataset: {cfg.DATASET!r}")
 
-    print(f"train classes: {len(train_fs.classes)} | "
-          f"val classes: {len(val_fs.classes)}")
+    print(f"Train classes: {len(train_fs.classes)} | "
+          f"Val classes: {len(val_fs.classes)}")
 
     train_sampler = EpisodeSampler(train_fs, cfg.DEVICE)
     val_sampler   = EpisodeSampler(val_fs,   cfg.DEVICE)
@@ -161,6 +194,7 @@ def get_datasets(cfg: Config):
 
 
 def conv_block(in_ch: int, out_ch: int, pool: bool = True) -> nn.Sequential:
+    """Conv → BN → ReLU → (MaxPool)"""
     layers = [
         nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
         nn.BatchNorm2d(out_ch),
@@ -172,6 +206,10 @@ def conv_block(in_ch: int, out_ch: int, pool: bool = True) -> nn.Sequential:
 
 
 class EmbeddingModule(nn.Module):
+    """
+    4-block CNN. First 2 blocks pool; last 2 preserve spatial dims
+    so the RelationModule can apply its own convolutions.
+    """
     def __init__(self, in_channels: int = 3):
         super().__init__()
         self.block1 = conv_block(in_channels, 64, pool=True)
@@ -183,6 +221,10 @@ class EmbeddingModule(nn.Module):
         return self.block4(self.block3(self.block2(self.block1(x))))
 
 class CrossAttention(nn.Module):
+    """
+    Query attends to Support features before relation scoring.
+    Uses multi-head attention on flattened spatial features.
+    """
     def __init__(self, channels: int = 64, num_heads: int = 4):
         super().__init__()
         self.channels = channels
@@ -196,46 +238,60 @@ class CrossAttention(nn.Module):
         self.norm2 = nn.LayerNorm(channels)
 
     def forward(self, support_feat: torch.Tensor, query_feat: torch.Tensor):
+        """
+        support_feat : (B, 64, H, W)
+        query_feat   : (B, 64, H, W)
+        returns      : (B, 128, H, W)  — same shape as before so rest of code unchanged
+        """
         B, C, H, W = support_feat.shape
-        s = support_feat.view(B, C, -1).permute(0, 2, 1)
-        q = query_feat.view(B, C, -1).permute(0, 2, 1)
+        # print("Attention called", B, C, H, W)
 
+        # flatten spatial dims → sequence of tokens
+        # (B, C, H, W) → (B, H*W, C)
+        s = support_feat.view(B, C, -1).permute(0, 2, 1)  # (B, HW, C)
+        q = query_feat.view(B, C, -1).permute(0, 2, 1)    # (B, HW, C)
+
+        # query attends to support
         q_attended, _ = self.attention(
-            query=q,
-            key=s,
+            query=q,   # what we want to enrich
+            key=s,     # what we attend over
             value=s
         )
-        q_attended = self.norm1(q + q_attended)
+        q_attended = self.norm1(q + q_attended)  # residual + norm
 
+        # support attends to query
         s_attended, _ = self.attention(
             query=s,
             key=q,
             value=q
         )
-        s_attended = self.norm2(s + s_attended)
+        s_attended = self.norm2(s + s_attended)  # residual + norm
 
-        # NOT USING CROSS AETTENTION
+        # reshape back to spatial
+        # (B, HW, C) → (B, C, H, W)
         # q_out = q_attended.permute(0, 2, 1).view(B, C, H, W)
         # s_out = s_attended.permute(0, 2, 1).view(B, C, H, W)
-
-        # USING CROSS ATTENTION
         q_out = q_attended.permute(0, 2, 1).contiguous().view(B, C, H, W)
         s_out = s_attended.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
-        return torch.cat([s_out, q_out], dim=1)
+        # concat just like before — drop-in replacement
+        return torch.cat([s_out, q_out], dim=1)  # (B, 128, H, W)
 
 class RelationModule(nn.Module):
     def __init__(self, input_size: int = 1600, num_heads: int = 4):
         super().__init__()
+        # cross attention replaces simple concatenation
         self.cross_attention = CrossAttention(channels=64, num_heads=num_heads)
 
+        # rest stays exactly the same as before
         self.conv1 = conv_block(128, 64, pool=True)
         self.conv2 = conv_block(64,  64, pool=True)
         self.fc1   = nn.Linear(input_size, 8)
         self.fc2   = nn.Linear(8, 1)
 
     def forward(self, support_feat: torch.Tensor, query_feat: torch.Tensor) -> torch.Tensor:
-        x = self.cross_attention(support_feat, query_feat)
+        # cross attention instead of raw concat
+        x = self.cross_attention(support_feat, query_feat)  # (B, 128, H, W)
         x = self.conv2(self.conv1(x))
         x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
@@ -251,26 +307,30 @@ def compute_relation_scores(
     n_way:    int,
     k_shot:   int,
 ) -> torch.Tensor:
-    s_feats = embed(support)
-    q_feats = embed(queries)
+    s_feats = embed(support)   # (n_way*k_shot, 64, h, w)
+    q_feats = embed(queries)   # (n_q,          64, h, w)
     _, C, H, W = s_feats.shape
 
+    # mean-pool K shots → prototypes (same as before)
     prototypes = torch.stack([
         s_feats[s_labels == cls].mean(dim=0) for cls in range(n_way)
-    ])
+    ])                         # (n_way, 64, h, w)
 
     n_q = q_feats.size(0)
     proto_exp = prototypes.unsqueeze(0).expand(n_q, -1, -1, -1, -1)
     query_exp = q_feats.unsqueeze(1).expand(-1, n_way, -1, -1, -1)
 
+    # reshape to (n_q * n_way, 64, h, w) for batch processing
     proto_flat = proto_exp.contiguous().view(n_q * n_way, C, H, W)
     query_flat = query_exp.contiguous().view(n_q * n_way, C, H, W)
 
+    # pass separately — attention handles the combination now
     scores = relate(proto_flat, query_flat).view(n_q, n_way)
     return scores
 
 
 def make_targets(q_labels: torch.Tensor, n_way: int) -> torch.Tensor:
+    """One-hot float targets for MSE loss."""
     targets = torch.zeros(q_labels.size(0), n_way, device=q_labels.device)
     targets.scatter_(1, q_labels.unsqueeze(1), 1.0)
     return targets
@@ -307,7 +367,6 @@ def evaluate(
     embed.train(); relate.train()
     avg_loss = total_loss / n_episodes
     return 100.0 * correct / total, avg_loss
-
 
 
 def train():
@@ -411,16 +470,24 @@ def train():
 
 def load_and_predict(
     checkpoint_path: str,
-    support_imgs:    torch.Tensor,
-    support_labels:  torch.Tensor,
-    query_img:       torch.Tensor,
+    support_imgs:    torch.Tensor,   # (n_way*k_shot, C, H, W)
+    support_labels:  torch.Tensor,   # (n_way*k_shot,)
+    query_img:       torch.Tensor,   # (C, H, W)
     n_way:           int,
     k_shot:          int,
     device:          str = 'cpu',
 ):
+    """
+    Load a saved checkpoint and classify one query image.
+
+    Returns:
+        predicted class index (int)
+        relation scores per class (tensor of length n_way)
+    """
     ckpt = torch.load(checkpoint_path, map_location=device)
 
     in_ch      = support_imgs.shape[1]
+    # infer input_size from spatial dim: 84px → 576, 28px → 64
     spatial    = support_imgs.shape[-1]
     input_size = 576 if spatial == 84 else 64
 
