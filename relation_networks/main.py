@@ -11,7 +11,7 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 import wandb
 
-os.environ["WANDB_API_KEY"] = "some api key I am not gonna tell"
+# os.environ["WANDB_API_KEY"] = "some api key I am not gonna tell"
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
 class Config:
